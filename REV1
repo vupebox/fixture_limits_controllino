@@ -1,0 +1,460 @@
+#include <SPI.h>
+#include <Controllino.h>
+
+const char* topicStatus = "device/status";
+const char* topicModel = "device/model";
+const char* topicPsi = "device/psi";
+const char* topicToSubscribe = "cmd/#";
+const char* topicCount = "device/count";
+
+//INPUTS
+int pinSensor = CONTROLLINO_A0;
+int pinModel1 = CONTROLLINO_A1;
+int pinModel2 = CONTROLLINO_A2;
+//int pinGuard = 2;  //Ya no es requerido
+int pinStart = CONTROLLINO_A3;
+int pinStop = CONTROLLINO_IN0;
+int pinReset = CONTROLLINO_IN1; //D5
+
+
+//OUTPUTS
+int pinPiston = CONTROLLINO_D0;
+int pinSolenoidValve1 = CONTROLLINO_D1;
+//int pinSolenoidValve2 = D8; //Ya no es requerido
+
+
+
+
+
+//GLOBAL VARIABLES
+char bufferPsi[32];
+char bufferCount[10];
+char bufferModel[3];
+
+const byte serialBufferSize = 128;
+char serialBuffer[serialBufferSize];
+int serialCount=0;
+
+uint8_t selectedModel = 1;
+int countingModel = 0;
+
+bool isPinStart = false;
+bool isGuard = false;
+bool isPinReset = false;
+bool isPinStop = false;
+bool isPinRelease = false;
+
+float psi = 0.0;
+float minPsi = 10.0;
+bool isModel1 = false;
+bool isModel2 = false;
+bool isStop = false;
+
+bool isReStart = false;
+bool isReStop = false;
+bool isReReset = false;
+bool isReRelease = false;
+
+bool isProcessStarted = false;
+bool isModelDetected = false;
+bool isPistonActived = false;
+bool isRightModel = false;
+bool failedTest = false;
+
+unsigned long timeWaitPiston = 4000; //Time1 
+unsigned long timeWaitSolenoidValve1 = 10000; //Time2 
+//unsigned long timeWaitSolenoidValve2 = 1000; //Time3  //Ya no es requerido
+unsigned long timeTest = 9000;
+unsigned long tmpTime;
+
+unsigned long tmpTimeAnalogRead = 0;
+unsigned long timeAnalogRead = 50;
+
+unsigned long timePsi = 250;
+unsigned long tmpTimePsi = 0;
+
+
+
+void setup(){
+  Serial.begin(115200);
+  setupPin();
+  resetParameters();
+  tmpTimePsi = millis();
+  Serial.print("<");
+  Serial.print("i");
+  Serial.println(">");
+}
+
+
+void loop(){
+  loopPin();
+  loopProcess();
+  loopRemote();
+  tmpTime = millis() - tmpTimePsi;
+  if( tmpTime >= timePsi){
+    sendMessage(topicPsi,bufferPsi);
+    sendMessage(topicCount,bufferCount);
+    sendMessage(topicModel,bufferModel);
+    sendMessage(topicStatus,"waiting");
+    tmpTimePsi = millis();
+  }
+}
+
+void loopRemote(){
+  countToBuffer();
+  modelToBuffer();
+  unsigned long maxTimeToWaitSerialReceive = 15;
+  unsigned long waitingToSerialReceive;
+
+  Serial.print("<r>");
+  waitingToSerialReceive = millis();
+  while ( (Serial.available() == 0) && (millis() - waitingToSerialReceive < maxTimeToWaitSerialReceive) ){
+    delay(1);
+  } 
+  loopSerialRemote();
+}
+
+void readSerialRemoteCmd(){
+   char counting[32];
+   char model[2];
+   int modelRemote = 0;
+   int countingRemote = 0;
+
+  int lastChar = 0;
+  int count = 0;
+  int i;
+   
+   if(serialBuffer[0] == '1'){
+      isReStart = true;
+   }
+
+   if(serialBuffer[2] == '1'){
+      isReReset = true;
+   }
+
+   if(serialBuffer[4] == '1'){
+      isReRelease = true;
+   }
+
+   if(serialBuffer[6] == '1'){
+      isReStop = true;
+   }
+
+  
+  
+  for (i = 8; i < serialCount; i++){
+    lastChar=i;
+    if(serialBuffer[i] == ':'){
+      model[count] = '\0';
+      break;
+    }else{
+      model[count]=serialBuffer[i];
+    }
+
+    count++;
+  }
+
+  count = 0;
+  for (i = lastChar + 1; i < serialCount; i++){
+    lastChar=i;
+    if(serialBuffer[i] == ':'){
+      counting[count] = '\0';
+      break;
+    }else{
+      counting[count]=serialBuffer[i];
+    }
+    count++;
+  }
+
+  countingRemote = atoi(counting);
+  modelRemote = atoi(model);
+
+  if (countingRemote > 0){
+    countingModel = countingRemote;
+  }
+
+  if (modelRemote > 0){
+    selectedModel = modelRemote;
+  }
+
+}
+
+void loopSerialRemote() {
+    static boolean recvInProgress = false;
+    static byte ndx = 0;
+    char startMarker = '<';
+    char endMarker = '>';
+    char rc;
+    
+    unsigned long serialWaitingTime = 2;
+    unsigned long serialTime; 
+
+    serialTime = millis();
+    if(Serial.available() > 0){
+      while ( (Serial.available() > 0) || ((millis() - serialTime) < serialWaitingTime) ) {
+         if(Serial.available() > 0){
+            serialTime = millis();
+            rc = Serial.read();
+            if (recvInProgress == true) {
+                if (rc != endMarker) {
+                    serialBuffer[ndx] = rc;
+                    ndx++;
+                    if (ndx >= serialBufferSize) {
+                        ndx = serialBufferSize - 1;
+                    }
+                }
+                else {
+                    serialBuffer[ndx] = '\0'; // terminate the string
+                    recvInProgress = false;
+                    serialCount = ndx;
+                    ndx = 0;
+                    readSerialRemoteCmd();
+                }
+            }
+    
+            else if (rc == startMarker) {
+                recvInProgress = true;
+            }
+        }
+      }
+    }
+}
+
+void generalLoop(){
+  loopRemote();
+  loopPin();
+};
+
+
+void sendMessage(char* topic,char message[64]){
+  Serial.print("<s:");
+  Serial.print(topic);
+  Serial.print(":");
+  Serial.print(message);
+  Serial.print(":>");
+}
+
+
+void startTest(){
+  //Activar electrovalvula 1, para ingresar aire
+  sendMessage(topicStatus,"startTest");
+  sendMessage(topicStatus,"onValve1");
+  digitalWrite(pinSolenoidValve1,HIGH);  
+  tmpTime = millis();
+  sendMessage(topicPsi,bufferPsi);
+  while( millis() - tmpTime < timeWaitSolenoidValve1){
+     if(isStop){
+       break;
+     }
+     generalLoop();
+  }
+ 
+  ////////////////
+  tmpTime = millis();
+  sendMessage(topicPsi,bufferPsi);
+  failedTest = false;
+  while( millis() - tmpTime < timeTest){
+     generalLoop();
+     if(isStop){
+       failedTest = false;
+       break;
+     }
+     if(psi < minPsi){
+        failedTest = true;
+        break;
+     }
+  }
+  sendMessage(topicPsi,bufferPsi);
+  
+  digitalWrite(pinSolenoidValve1,LOW); 
+  sendMessage(topicStatus,"offValve1");
+
+  if(!isStop){
+    if(failedTest){
+      sendMessage(topicStatus,"failTest");
+      while( !(isReRelease || isPinRelease) ){
+         if(isStop){
+           break;
+         }
+         generalLoop();
+         delayMicroseconds(1);
+      }
+      isReRelease = false;
+      isPinRelease = false;
+    }else{
+      countingModel = countingModel - 1;
+      countToBuffer();
+      sendMessage(topicStatus,"passTest");
+      sendMessage(topicCount,bufferCount);
+    }
+  }
+
+}
+
+void loopProcess(){
+  if((isPinStart || isReStart) && !isStop){
+      if(countingModel > 0){
+            sendMessage(topicStatus,"start");
+            generalLoop();
+            if( isModel1 || isModel2 ){
+               sendMessage(topicStatus,"onPiston");
+               digitalWrite(pinPiston,HIGH);  
+               tmpTime = millis();
+               while( millis() - tmpTime < timeWaitPiston){
+                  generalLoop();
+                  if(isStop){
+                      break;
+                   }
+               }
+               //#####################
+      
+                //Verificar si modelo es el correcto
+               if(!isStop){
+                 if(  (isModel1 && (selectedModel == 1)) || (isModel2 && (selectedModel == 2)) ){
+                    //Es correcto, empezar test
+                    sendMessage(topicStatus,"modelRight");
+                    startTest();
+                   
+                 }else{
+                    //Es modelo incorrecto, esperar que se presione liberar
+                    sendMessage(topicStatus,"modelWrong");
+                    while( !(isReRelease || isPinRelease) ){
+                      if(isStop){
+                        break;
+                      }
+                      generalLoop();
+                      delayMicroseconds(1);
+                    }
+                    isReRelease = false;
+                    isPinRelease = false;
+                 }
+               }
+      
+                //// Liberar Piston y esperar un segundo
+               
+               tmpTime = millis();
+               while( millis() - tmpTime < timeWaitPiston){
+                  if(isStop){
+                      break;
+                  }
+                  generalLoop();
+               }
+               sendMessage(topicStatus,"offPiston");
+               digitalWrite(pinPiston,LOW);
+               sendMessage(topicStatus,"end");
+            }else{
+              sendMessage(topicStatus,"noModel");
+            }
+        }else{
+          sendMessage(topicStatus,"noCounting"); 
+      }
+
+      if(isStop){
+        sendMessage(topicStatus,"stop"); 
+        while( isStop || !(isPinReset || isReReset) ){
+          resetParameters();
+          generalLoop();
+          delayMicroseconds(1);
+        }
+      }
+      clearParameters();
+      resetParameters();
+  }
+  resetParameters();
+ 
+}
+
+void resetParameters(){
+  clearParameters();
+  isStop = false;
+  isPinReset = false;
+  isReReset = false;
+  isReStart  = false;
+  isReStop = false;
+}
+
+void clearParameters(){
+  //isGuard = false;
+  isPinStart = false;
+  isPinStop = false;
+  isPinReset = false;
+  isPinRelease = false;
+  isReStart = false;
+  isModel1 = false;
+  isModel2 = false;
+  isReRelease = false;
+}
+
+bool statePin(int pin, bool invert){
+  bool state = digitalRead(pin);
+  if(invert)
+    state = !state;
+  return state; 
+}
+
+
+
+void setupPin(){
+  pinMode(pinModel1,INPUT);
+  pinMode(pinModel2,INPUT);
+  //pinMode(pinGuard,INPUT); //No requerido
+  pinMode(pinStart,INPUT);
+  pinMode(pinStop,INPUT);
+  pinMode(pinReset,INPUT);
+
+  pinMode(pinPiston,OUTPUT);
+  pinMode(pinSolenoidValve1,OUTPUT);
+ // pinMode(pinSolenoidValve2,OUTPUT); //No requerido
+}
+
+void countToBuffer(){
+  snprintf(bufferCount, sizeof bufferCount, "%d", countingModel);
+}
+
+void modelToBuffer(){
+  snprintf(bufferModel, sizeof bufferModel, "%d", selectedModel);
+}
+
+void loopPin(){
+  //isGuard = statePin(pinGuard,true); No requerido
+  isPinStart = statePin(pinStart,false);
+  isPinStop = statePin(pinStop,false);
+  isPinReset = statePin(pinReset,false);
+  isPinRelease = isPinReset;
+
+  
+  isModel1 = statePin(pinModel1,false);
+  isModel2 = statePin(pinModel2,false);
+
+
+  psi = readSensor(pinSensor);
+  //snprintf(bufferPsi, sizeof bufferPsi, "%f", psi);
+  int intPsi = int(psi);
+  int decimalPsi = int((psi - float(intPsi))*1000);
+  snprintf(bufferPsi, sizeof bufferPsi, "%d.%d", intPsi, decimalPsi);
+  //dtostrf(psi,10,2,bufferPsi); //Llamada a la función
+  //Serial.print(bufferPsi);
+
+  if(isPinStop || isReStop)
+   isStop = true;  
+}
+
+float readSensor(int pin){
+  int analog_value = analogRead(pin);
+  float value = (float)analog_value * 12.0;
+  float voltage = (float)value / float(1023);
+  //return voltage;
+  //return mapF(voltage,0.5,4.5,0.0,174.045); // psi
+  return mapF(voltage,0.527,0.609,8.0,13.0); // psi
+  /*psiINT = (int) psi;
+  psiDECIMAL = (int) ((psi - (float)psiINT)*100.0);*/
+}
+
+float mapF(float x, float in_min, float in_max, float out_min, float out_max) {
+  float value = (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  /*if(value < out_min)
+    value = out_min;*/
+  if(value < 0.0)
+    value = 0.0;
+  return value;
+}
